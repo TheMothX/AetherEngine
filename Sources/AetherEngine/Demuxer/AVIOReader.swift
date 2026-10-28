@@ -390,6 +390,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// that outlives `rateLimitRepinStreak` paced attempts is a pinned edge target whose
     /// session expired (a resume after minutes of pause), and there the pin is dropped
     /// for one re-resolve through the source.
+    /// CRIVID FORK: a 2xx on a live source whose body is a short text, which is how an Xtream panel at
+    /// its connection cap says no. Both conditions: a TS feed served with a wrong `text/*` type has no
+    /// Content-Length (it never ends), and a short binary body is not a refusal. 64 KiB is far above
+    /// the panels' 100-300 byte notices and far below any real segment.
+    static func isLiveTextRefusal(_ http: HTTPURLResponse) -> Bool {
+        guard http.statusCode == 200 || http.statusCode == 206 else { return false }
+        let type = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+        guard type.hasPrefix("text/") else { return false }
+        let length = http.expectedContentLength
+        return length >= 0 && length <= 65_536
+    }
+
     static func isRateLimitStatus(_ status: Int) -> Bool {
         return status == 429 || status == 503 || status == 509
     }
@@ -3241,7 +3253,34 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         respondedBy: URL?,
         generation: Int
     ) -> Bool {
-        let status = http.statusCode
+        var status = http.statusCode
+        // CRIVID FORK (29.10, not upstream): an Xtream panel at its connection cap answers HTTP 200 with
+        // a short text body («CONNECTION LIMIT REACHED / This account is already streaming on another
+        // device»). Taken as media, those bytes went into the window, the connection ended, and the
+        // ladder saw progress: a new request at once, 436 in 10 s against a test origin with a 10 s
+        // slot hold (measured 28.10). It is the same refusal as the 509 below, so it takes the 509
+        // road: metered pacing, Retry-After, bounded give-up, and the body never reaches the window.
+        // Known costs, accepted 29.10: noteOriginRefusal(509) halves this origin's concurrency budget for the
+        // rest of the process (VOD from the same host loses its parallel paths until relaunch); and an HLS
+        // playlist served as text/plain with a length is refused here before the AE#140 body sniff could
+        // reroute it (only an extensionless live URL that is really HLS can hit that).
+        if isLive, Self.isLiveTextRefusal(http) {
+            EngineLog.emit(
+                "[AVIOReader] \(label) gen=\(generation) live origin answered \(status) with a short text body "
+                + "(\(http.value(forHTTPHeaderField: "Content-Type") ?? "-"), \(http.expectedContentLength) B): "
+                + "connection cap refusal, treated as 509",
+                category: .demux)
+            status = 509
+        } else if isLive, (status == 200 || status == 206),
+                  (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased().hasPrefix("text/") {
+            // Not reclassified (no length: could be a mislabelled endless TS feed), but named, so a field
+            // trace shows which refusal shape a panel uses if the storm ever comes back (Opus 29.10).
+            EngineLog.emit(
+                "[AVIOReader] \(label) gen=\(generation) live origin answered \(status) with a text type and no "
+                + "short length (Transfer-Encoding: \(http.value(forHTTPHeaderField: "Transfer-Encoding") ?? "-"), "
+                + "\(http.expectedContentLength) B): kept as a stream",
+                category: .demux)
+        }
         var isOK = status == 200 || status == 206
         var retryAfter: TimeInterval = 0
         if Self.isRateLimitStatus(status) {
