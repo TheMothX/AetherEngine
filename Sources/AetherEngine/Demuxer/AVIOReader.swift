@@ -442,7 +442,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // engine asks about. Stamp the source URL as a witness, without moving its budget: the
         // proxy did not refuse us and should not be throttled for it.
         if OriginRequestBudget.originKey(for: refusing) != OriginRequestBudget.originKey(for: url) {
-            OriginRequestBudget.shared.noteRefusalWitnessed(for: url)
+            OriginRequestBudget.shared.noteRefusalWitnessed(for: url, status: status)  // CRIVID FORK: status
         }
     }
 
@@ -3282,6 +3282,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 category: .demux)
         }
         var isOK = status == 200 || status == 206
+        if isOK {
+            // CRIVID FORK: accepted again, so an earlier refusal no longer explains a failure. Live and
+            // VOD alike: a film opened right after live TV is refused by the lingering slot and then
+            // accepted, and must not read as "in use elsewhere" if it fails on its format (Opus 29.10).
+            OriginRequestBudget.shared.noteAccepted(for: respondedBy ?? requestURL())
+            OriginRequestBudget.shared.noteAccepted(for: url)
+        }
         var retryAfter: TimeInterval = 0
         if Self.isRateLimitStatus(status) {
             retryAfter = Self.parseRetryAfter(http)

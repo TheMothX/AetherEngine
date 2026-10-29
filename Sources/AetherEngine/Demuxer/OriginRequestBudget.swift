@@ -113,6 +113,9 @@ final class OriginRequestBudget: @unchecked Sendable {
         var hostLimit: Int?
         var refusals = 0
         var lastRefusalAt: DispatchTime?
+        /// CRIVID FORK: the status of the refusal at `lastRefusalAt`, nil when that stamp is a witness
+        /// (`noteRefusalWitnessed`), which has none of its own.
+        var lastRefusalStatus: Int?
         /// nil `quietUntil` means the request-rate pacer is inert. The bucket remains untouched
         /// until the first refusal so an unmetered origin keeps its old request shape exactly.
         var tokens = 0.0
@@ -204,6 +207,10 @@ final class OriginRequestBudget: @unchecked Sendable {
                 merged.limit = Self.tighter(merged.limit, hostLimit)
             }
             if let theirs = joining.lastRefusalAt {
+                // CRIVID FORK: the status follows the stamp it belongs to.
+                if merged.lastRefusalAt.map({ theirs > $0 }) ?? true {
+                    merged.lastRefusalStatus = joining.lastRefusalStatus
+                }
                 merged.lastRefusalAt = merged.lastRefusalAt.map { max($0, theirs) } ?? theirs
             }
             if let theirQuiet = joining.quietUntil {
@@ -516,6 +523,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         disarmPacerIfQuietLocked(&state, at: instant)
         state.refusals += 1
         state.lastRefusalAt = instant
+        state.lastRefusalStatus = status  // CRIVID FORK
         state.refusalStreak += 1
         // A cap of zero means "do not arm at all", not "arm with a zero quiet period": arming empties
         // the bucket, and an empty bucket alone still costs two seconds a request at the refill rate.
@@ -559,13 +567,16 @@ final class OriginRequestBudget: @unchecked Sendable {
     /// which is the proxy's, and asking the proxy's key whether the CDN refused us returns false
     /// forever: the classification would be built, published, and silently never reached. So the
     /// source URL carries the timestamp too, and only the timestamp.
-    func noteRefusalWitnessed(for url: URL) {
+    func noteRefusalWitnessed(for url: URL, status: Int? = nil) {
         guard let raw = Self.originKey(for: url) else { return }
         let instant = now()
         lock.lock(); defer { lock.unlock() }
         let key = headLocked(raw)
         var state = origins[key] ?? OriginState()
         state.lastRefusalAt = instant
+        // CRIVID FORK: the witness carries the refusal's status. On a folded chain this is the same
+        // state the refusal just wrote, and a nil here erased the 509 (Opus 29.10).
+        state.lastRefusalStatus = status
         origins[key] = state
     }
 
@@ -578,6 +589,28 @@ final class OriginRequestBudget: @unchecked Sendable {
         guard let last = origins[headLocked(raw)]?.lastRefusalAt else { return false }
         let elapsed = Self.elapsedSeconds(from: last, to: now())
         return elapsed <= window
+    }
+
+    /// CRIVID FORK: the origin answered with media again, so the last refusal no longer explains a
+    /// failure. Without this an account's own lingering slot, refused at a zap and then accepted,
+    /// would still read as "in use elsewhere" when the new channel dies seconds later (Opus 29.10).
+    /// Only the status is cleared; `lastRefusalAt` stays upstream's.
+    func noteAccepted(for url: URL) {
+        guard let raw = Self.originKey(for: url) else { return }
+        lock.lock(); defer { lock.unlock() }
+        let key = headLocked(raw)
+        guard origins[key]?.lastRefusalStatus != nil else { return }
+        origins[key]?.lastRefusalStatus = nil
+    }
+
+    /// CRIVID FORK: the status this origin refused with, when that was within `window`. nil when it
+    /// did not refuse, refused longer ago, or the latest stamp is a witness without a status.
+    func recentRefusalStatus(_ url: URL, within window: TimeInterval) -> Int? {
+        guard let raw = Self.originKey(for: url) else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        guard let state = origins[headLocked(raw)], let last = state.lastRefusalAt,
+              Self.elapsedSeconds(from: last, to: now()) <= window else { return nil }
+        return state.lastRefusalStatus
     }
 
     // MARK: - Dropped redirect targets (#377 round 5)
