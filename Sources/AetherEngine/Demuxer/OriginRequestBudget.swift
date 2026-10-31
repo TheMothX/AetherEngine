@@ -143,6 +143,15 @@ final class OriginRequestBudget: @unchecked Sendable {
     /// second origin as far as a request budget is concerned: every request keyed on either end is
     /// answered by the same server, so both ends share one set of books.
     private var chainHead: [String: String] = [:]
+    /// CRIVID FORK: live refusal ROUNDS per chain, a refusal followed by an accepted live answer, stamped
+    /// at the accept. Kept apart from `lastRefusalStatus`, which an accepted answer clears: a panel that
+    /// cuts the newest connection over its cap refuses the reconnect and accepts the one after, so only a
+    /// log that outlives the accept shows the loop. Counted per round, not per refusal: one outage while
+    /// the panel still holds our own dead slot answers several refusals in a row (four 403 in 14 s in the
+    /// simulator) and is still one round.
+    private var liveDenials: [String: [DispatchTime]] = [:]
+    /// CRIVID FORK: chains with a live refusal not yet followed by an accepted live answer.
+    private var liveDenialPending: Set<String> = []
     private let now: () -> DispatchTime
 
     init(now: @escaping () -> DispatchTime = { .now() }) {
@@ -611,6 +620,34 @@ final class OriginRequestBudget: @unchecked Sendable {
         guard let state = origins[headLocked(raw)], let last = state.lastRefusalAt,
               Self.elapsedSeconds(from: last, to: now()) <= window else { return nil }
         return state.lastRefusalStatus
+    }
+
+    /// CRIVID FORK: a live source of `url` was refused (403/429/509). Counted when a live answer is
+    /// accepted after it (`noteLiveAccepted`).
+    func noteLiveDenial(for url: URL) {
+        guard let raw = Self.originKey(for: url) else { return }
+        lock.lock(); defer { lock.unlock() }
+        liveDenialPending.insert(headLocked(raw))
+    }
+
+    /// CRIVID FORK: a live source of `url` was accepted. Closes a round when a refusal came before it.
+    /// The last 16 rounds are kept.
+    func noteLiveAccepted(for url: URL) {
+        guard let raw = Self.originKey(for: url) else { return }
+        let instant = now()
+        lock.lock(); defer { lock.unlock() }
+        let key = headLocked(raw)
+        guard liveDenialPending.remove(key) != nil else { return }
+        liveDenials[key, default: []].append(instant)
+        if liveDenials[key]!.count > 16 { liveDenials[key]!.removeFirst() }
+    }
+
+    /// CRIVID FORK: how many live refusal rounds the origin of `url` had within `window`.
+    func liveDenialCount(_ url: URL, within window: TimeInterval) -> Int {
+        guard let raw = Self.originKey(for: url) else { return 0 }
+        let instant = now()
+        lock.lock(); defer { lock.unlock() }
+        return (liveDenials[headLocked(raw)] ?? []).filter { Self.elapsedSeconds(from: $0, to: instant) <= window }.count
     }
 
     // MARK: - Dropped redirect targets (#377 round 5)

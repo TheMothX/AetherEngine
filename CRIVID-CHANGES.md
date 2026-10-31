@@ -1,7 +1,7 @@
 # Modified by Crivid AS
 
 This is AetherEngine 7.15.1 (upstream: https://github.com/superuser404notfound/AetherEngine,
-tag 7.15.1, b93f9c4b) with two changes made by Crivid AS for the Crivid IPTV Player on tvOS.
+tag 7.15.1, b93f9c4b) with three changes made by Crivid AS for the Crivid IPTV Player on tvOS.
 It is distributed under the same license as upstream (LGPL-3.0 with the App Store exception,
 see LICENSE).
 
@@ -33,5 +33,22 @@ dead channel. The budget already stamps every 429/503/509; it now keeps the stat
 stamp, and a public static function returns it when it is recent. The Crivid player uses it to
 tell the user the account is in use on another device instead of handing the stream to a second
 player that the same panel refuses.
+
+### 3. The host can ask how often a live source was cut and refused
+
+`Sources/AetherEngine/Demuxer/AVIOReader.swift` (`isLiveDenialStatus` and the calls to
+`noteLiveDenial` and `noteLiveAccepted` in `persistentReceivedResponse`),
+`Sources/AetherEngine/Demuxer/OriginRequestBudget.swift` (`liveDenials`, `liveDenialPending`,
+`noteLiveDenial`, `noteLiveAccepted`, `liveDenialCount`) and
+`Sources/AetherEngine/AetherEngine+CrividOriginRefusal.swift` (`AetherEngine.recentLiveDenials(for:within:)`):
+
+Measured on an Apple TV against an Xtream panel at its connection cap: the panel cuts the newest
+connection with a clean end every 11-44 s, refuses the reconnect with 403 and accepts the one 1-2 s
+later. The engine recovers in about a second, so nothing shows on screen while the other devices on the
+account stall, and the accepted answer clears the refusal change 2 reads. The budget now counts live
+refusal rounds, a 403/429/509 on a live source followed by an accepted live answer, stamped at the
+accept, and a public static function returns how many fell within a window. One outage with several
+refusals in a row is one round. The Crivid player tells the user the account is in use after three
+rounds within 120 s of the channel showing a picture.
 
 All changes are marked `CRIVID FORK` in the source.

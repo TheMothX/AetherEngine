@@ -406,6 +406,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return status == 429 || status == 503 || status == 509
     }
 
+    /// CRIVID FORK: the statuses a live panel refuses an account at its cap with (403 measured on an
+    /// Xtream panel 29.10; 429/509 as the rate-limit path reads them). 503 is left out: a server down.
+    static func isLiveDenialStatus(_ status: Int) -> Bool {
+        return status == 403 || status == 429 || status == 509
+    }
+
     /// Hard server errors answered by a pinned post-redirect URL: the redirect target
     /// may be dead or expired while the source URL would mint a fresh one. Rate-limit
     /// statuses are excluded — the origin is metering us, and the pin is not the
@@ -3281,6 +3287,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 + "\(http.expectedContentLength) B): kept as a stream",
                 category: .demux)
         }
+        // CRIVID FORK (29.10, not upstream): a live refusal goes in a log the next accept does not clear.
+        // Measured on an Apple TV against an Xtream panel at its cap: it cuts the newest connection with a
+        // clean end after 11-44 s, answers the reconnect 403 and the one 1-2 s later 200. Each round reads
+        // as a short stall here and is invisible on screen; the host counts the rounds (a refusal, then an
+        // accepted live answer) to tell the user.
+        if isLive, Self.isLiveDenialStatus(status) { OriginRequestBudget.shared.noteLiveDenial(for: url) }
         var isOK = status == 200 || status == 206
         if isOK {
             // CRIVID FORK: accepted again, so an earlier refusal no longer explains a failure. Live and
@@ -3289,6 +3301,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             OriginRequestBudget.shared.noteAccepted(for: respondedBy ?? requestURL())
             OriginRequestBudget.shared.noteAccepted(for: url)
         }
+        // CRIVID FORK: an accepted live answer closes a refusal round (`noteLiveDenial` above).
+        if isLive, isOK { OriginRequestBudget.shared.noteLiveAccepted(for: url) }
         var retryAfter: TimeInterval = 0
         if Self.isRateLimitStatus(status) {
             retryAfter = Self.parseRetryAfter(http)
