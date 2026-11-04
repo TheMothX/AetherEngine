@@ -2227,6 +2227,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 let streakDesc = isRateLimited ? "\(rateLimitStreak) consecutive rate-limited" : "\(unproductiveReconnects) unproductive"
                 EngineLog.emit("[AVIOReader] \(label) reconnect exhausted at offset \(frontier) status=\(status) (\(streakDesc))\(isLive ? " [live source lost]" : "")", category: .demux)
                 emitNetworkPhase(.exhausted)   // ladder spent; the reopen owns recovery, the source is still down (#410)
+                // CRIVID FORK: a live source that never gave a byte and said 404/410 is gone, see CrividDeadSource.
+                if isLive, !isClosed, totalRead == 0, frontier == 0 { CrividDeadSource.note(url, status: status) }
                 if isLive {
                     return totalRead > 0 ? Int32(totalRead) : FFmpegErr.eio
                 }
@@ -3324,6 +3326,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // from byte 0 (silent corruption). Reject it. Live is exempt: transcode
         // reconnect legitimately answers 200 with "from now".
         let requestedOffset = (generation == connGeneration) ? connRequestedOffset : 0
+        // CRIVID FORK (CrividDeadSource): stamp at the FIRST 404/410 at byte 0, not only when the ladder gives up.
+        // A host whose own open watchdog fires before the give-up must still see it (Opus 04.11, MEDIUM 1).
+        if isLive, generation == connGeneration, requestedOffset == 0, !isClosed,
+           CrividDeadSource.isDeadStatus(status) {
+            CrividDeadSource.note(url, status: status)
+        }
+        // CRIVID FORK (CrividDeadSource): an accepted live answer means the channel is there. Same guards as the
+        // stamp, so a late 200 from an old generation or a closed reader cannot wipe a new opening's stamp
+        // (Opus 04.11 runde 2, funn 1).
+        if isLive, isOK, generation == connGeneration, !isClosed { CrividDeadSource.clear(url) }
         // #331: the origin just told us its live stream has no byte address to resume at. Latch
         // it, so every later request in this session is the join shape instead of repeating an
         // offset that can only ever be rejected again. Nonzero offsets only: a 416 at zero is a
